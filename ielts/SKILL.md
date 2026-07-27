@@ -256,6 +256,81 @@ python3 ~/.claude/skills/shared/ielts_cli.py memory add \
 
 ---
 
+## Obsidian Vault 同步（可选）
+
+把 `~/.ielts/` 的数据投影成 Obsidian 笔记，vault 可以放在 NAS 上。
+
+**JSON 永远是唯一 source of truth。** vault 里的 Markdown 是投影：SM-2 复习状态、错题计数只由 CLI 写，不从 vault 读回。
+
+### 设置（一次性）
+
+```bash
+python3 ~/.claude/skills/shared/ielts_cli.py config set --vault-path /path/to/Obsidian
+python3 ~/.claude/skills/shared/ielts_cli.py vault status
+```
+
+没设置 `vault_path` 时所有 vault 命令直接跳过，不影响任何其他功能。
+
+### 什么时候导出
+
+**在一次练习 session 结束时调用一次，不要每记录一笔就调用。**
+
+```bash
+python3 ~/.claude/skills/shared/ielts_cli.py vault export
+```
+
+比如：批改完作文并保存 → 会话收尾时 export 一次；连续加了 10 个单词 → 最后 export 一次。
+只想同步一部分：
+
+```bash
+python3 ~/.claude/skills/shared/ielts_cli.py vault export --only vocab,synonym
+# 可选类型：memory,writing,vocab,synonym,speaking,progress,errors
+python3 ~/.claude/skills/shared/ielts_cli.py vault export --dry-run   # 只看会做什么
+```
+
+### Fail-soft（重要）
+
+`vault_path` 没设置、路径不存在（NAS 没挂载）、或不可写时，命令输出
+`{"status":"skipped","reason":"..."}` 并 **正常退出（exit 0）**。
+**看到 skipped 不要报错、不要重试、不要中断当前流程**——顶多提一句「vault 没挂载，已跳过同步」。
+
+### vault 里的结构
+
+```text
+<vault>/IELTS/
+├── IELTS.md      # MOC 索引，链到下面所有内容 + 摘要数字
+├── 进度.md        # 目标 / 分数趋势 / 阅读记录表 / 听力记录表
+├── 错题本.md      # 按 count 排序的错误标签表
+├── memory/YYYY-MM-DD-<id>.md
+├── writing/YYYY-MM-DD-<slug>.md
+├── vocab/<word>.md
+├── synonym/<word>.md
+└── speaking/YYYY-MM-DD-<slug>.md
+```
+
+阅读 / 听力不生成单独笔记，只汇进「进度.md」的表格。
+
+### 用户的手写内容不会被覆盖
+
+每篇生成的笔记 body 被 `<!-- ielts:generated:start -->` / `<!-- ielts:generated:end -->` 包住。
+重新 export 时只重写标记之间的内容；标记外的手写笔记 **逐字保留**。
+frontmatter 里 CLI 拥有的 key 会被覆盖，用户自己加的 key 保留。内容没变就不重写文件（避免 NAS 无谓的 mtime 变动）。
+
+**所以：告诉用户想加笔记就写在标记外面。**
+
+### 把 Obsidian 里手动新增的笔记收回来
+
+用户直接在 Obsidian 的 `IELTS/vocab/` 或 `IELTS/memory/` 里新建了笔记：
+
+```bash
+python3 ~/.claude/skills/shared/ielts_cli.py vault import
+```
+
+只收「没有 `ielts_id` / `ielts_managed`」的笔记，收完自动补 id 并重新导出。
+已经 managed 的笔记一律不从 vault 读回（避免双向冲突）。导入的单词 SM-2 用默认值（EF 2.5，今天到期）。
+
+---
+
 ## 备份与迁移
 
 提醒用户定期备份：

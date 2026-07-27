@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import shutil
 import zipfile
@@ -26,19 +27,55 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 # ── Paths ──────────────────────────────────────────────────────────
-IELTS_DIR = Path.home() / ".ielts"
-CONFIG_FILE = IELTS_DIR / "config.json"
-ERRORS_FILE = IELTS_DIR / "errors.json"
-SYNONYMS_FILE = IELTS_DIR / "synonyms.json"
-PROGRESS_FILE = IELTS_DIR / "progress.json"
-VOCAB_FILE = IELTS_DIR / "vocab.json"
-WRITING_DIR = IELTS_DIR / "writing"
-READING_DIR = IELTS_DIR / "reading"
-LISTENING_DIR = IELTS_DIR / "listening"
-SPEAKING_DIR = IELTS_DIR / "speaking"
-MEMORY_FILE = IELTS_DIR / "memories.json"
-DASHBOARD_FILE = IELTS_DIR / "dashboard.html"
+# All data lives under IELTS_DIR. Default is ~/.ielts, overridable with the
+# IELTS_HOME environment variable (used by the test suite so it never touches
+# the real user data). The module-level constants below are recomputed by
+# _resolve_paths(), which runs at import time and again at the top of main().
+
+IELTS_DIR = None
+CONFIG_FILE = None
+ERRORS_FILE = None
+SYNONYMS_FILE = None
+PROGRESS_FILE = None
+VOCAB_FILE = None
+WRITING_DIR = None
+READING_DIR = None
+LISTENING_DIR = None
+SPEAKING_DIR = None
+MEMORY_FILE = None
+DASHBOARD_FILE = None
 DASHBOARD_TEMPLATE = Path(__file__).resolve().parent.parent / "dashboard" / "template.html"
+
+
+def _ielts_home() -> Path:
+    """Resolve the data root: $IELTS_HOME if set and non-empty, else ~/.ielts."""
+    env = os.environ.get("IELTS_HOME", "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".ielts"
+
+
+def _resolve_paths():
+    """(Re)compute every module-level path constant from the current environment."""
+    global IELTS_DIR, CONFIG_FILE, ERRORS_FILE, SYNONYMS_FILE, PROGRESS_FILE
+    global VOCAB_FILE, WRITING_DIR, READING_DIR, LISTENING_DIR, SPEAKING_DIR
+    global MEMORY_FILE, DASHBOARD_FILE
+
+    IELTS_DIR = _ielts_home()
+    CONFIG_FILE = IELTS_DIR / "config.json"
+    ERRORS_FILE = IELTS_DIR / "errors.json"
+    SYNONYMS_FILE = IELTS_DIR / "synonyms.json"
+    PROGRESS_FILE = IELTS_DIR / "progress.json"
+    VOCAB_FILE = IELTS_DIR / "vocab.json"
+    WRITING_DIR = IELTS_DIR / "writing"
+    READING_DIR = IELTS_DIR / "reading"
+    LISTENING_DIR = IELTS_DIR / "listening"
+    SPEAKING_DIR = IELTS_DIR / "speaking"
+    MEMORY_FILE = IELTS_DIR / "memories.json"
+    DASHBOARD_FILE = IELTS_DIR / "dashboard.html"
+
+
+_resolve_paths()
 
 
 # ── Data Models ────────────────────────────────────────────────────
@@ -53,6 +90,7 @@ class Config:
     speaking: float = 0.0
     name: str = ""
     updated_at: str = ""
+    vault_path: str = ""  # Obsidian vault root (may live on a NAS mount)
 
     def days_until_exam(self) -> int:
         if not self.exam_date:
@@ -246,6 +284,7 @@ def cmd_config_set(args):
         "writing": "writing",
         "speaking": "speaking",
         "name": "name",
+        "vault_path": "vault_path",
     }
 
     updated = False
@@ -254,6 +293,8 @@ def cmd_config_set(args):
         if val is not None:
             if config_key in ("target_score", "listening", "reading", "writing", "speaking"):
                 val = float(val)
+            elif config_key == "vault_path":
+                val = str(val).strip()
             config[config_key] = val
             updated = True
 
@@ -837,9 +878,961 @@ def cmd_memory_delete(args):
     return 0
 
 
+# ── Obsidian Vault Sync ────────────────────────────────────────────
+#
+# JSON under ~/.ielts stays the single source of truth. The vault holds a
+# Markdown *projection* of it. SM-2 state and error counts are only ever
+# written by this CLI, never read back from the vault.
+#
+# Everything here is fail-soft: if vault_path is unset / missing / unwritable
+# (e.g. the NAS is not mounted), the commands print {"status":"skipped",...}
+# and exit 0 so the calling skill never breaks.
+
+VAULT_ROOT_NAME = "IELTS"
+GEN_START = "<!-- ielts:generated:start -->"
+GEN_END = "<!-- ielts:generated:end -->"
+
+EXPORT_TYPES = ["memory", "writing", "vocab", "synonym", "speaking", "progress", "errors"]
+IMPORT_TYPES = ["vocab", "memory"]
+
+MEMORY_CATEGORIES = ["observation", "preference", "weakness", "strength", "strategy", "note"]
+MEMORY_SKILLS = ["general", "writing", "reading", "listening", "speaking", "vocab"]
+MEMORY_PRIORITIES = ["high", "medium", "low"]
+
+_FM_KEY_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_\-. ]*):(?:\s|$)")
+
+
+# ── Frontmatter / note primitives ──────────────────────────────────
+
+def _safe_filename(text: str, max_len: int = 80) -> str:
+    """Filesystem-safe note filename. Keeps unicode, drops path-hostile chars."""
+    bad = set('/\\:*?"<>|')
+    out = "".join(" " if (c in bad or ord(c) < 32) else c for c in str(text))
+    out = " ".join(out.split()).strip(" .")
+    return out[:max_len] or "untitled"
+
+
+def _yaml_scalar(value) -> str:
+    """Serialize a scalar for YAML frontmatter (stdlib-only, no pyyaml)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return '""'
+    if isinstance(value, (int, float)):
+        return str(value)
+    s = str(value)
+    needs_quote = (
+        s == ""
+        or s != s.strip()
+        or s.lower() in ("true", "false", "null", "yes", "no", "on", "off")
+        or s[0] in "-?:,[]{}#&*!|>'\"%@`"
+        or ": " in s
+        or s.endswith(":")
+        or "#" in s
+        or "\n" in s
+    )
+    if needs_quote:
+        s = s.replace("\\", "\\\\").replace('"', '\\"')
+        s = s.replace("\n", " ").replace("\r", " ")
+        return '"' + s + '"'
+    return s
+
+
+def _parse_scalar(raw: str):
+    """Very small YAML scalar reader — enough for the keys we own."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s[0] == '"' and s.endswith('"') and len(s) >= 2:
+        s = s[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        return s
+    if s[0] == "'" and s.endswith("'") and len(s) >= 2:
+        return s[1:-1].replace("''", "'")
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low in ("null", "~"):
+        return None
+    return s
+
+
+def _fm_lines(key: str, value) -> list:
+    """Render one frontmatter entry as a list of raw lines."""
+    if isinstance(value, dict):
+        if not value:
+            return [f"{key}: {{}}"]
+        lines = [f"{key}:"]
+        for k, v in value.items():
+            lines.append(f"  {k}: {_yaml_scalar(v)}")
+        return lines
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return [f"{key}: []"]
+        return [f"{key}:"] + [f"  - {_yaml_scalar(v)}" for v in value]
+    return [f"{key}: {_yaml_scalar(value)}"]
+
+
+def _split_note(text: str):
+    """Split a note into (frontmatter_entries, body).
+
+    frontmatter_entries is an ordered list of (key, raw_lines) so that keys the
+    CLI does not own survive a round-trip byte-for-byte.
+    """
+    if not text.startswith("---\n") and text != "---":
+        return [], text
+
+    lines = text.split("\n")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() in ("---", "..."):
+            end = i
+            break
+    if end is None:
+        return [], text
+
+    entries = []
+    for line in lines[1:end]:
+        m = _FM_KEY_RE.match(line)
+        if m and not line.startswith((" ", "\t", "-")):
+            entries.append((m.group(1).strip(), [line]))
+        elif entries:
+            entries[-1][1].append(line)
+        # a stray continuation with no key is dropped (malformed frontmatter)
+
+    body = "\n".join(lines[end + 1:])
+    return entries, body.lstrip("\n")
+
+
+def _fm_get(entries, key, default=None):
+    """Read a single-line frontmatter value from parsed entries."""
+    for k, raw_lines in entries:
+        if k == key:
+            _, _, raw = raw_lines[0].partition(":")
+            if len(raw_lines) > 1:
+                items = [ln.strip()[2:].strip() for ln in raw_lines[1:] if ln.strip().startswith("- ")]
+                if items:
+                    return [_parse_scalar(i) for i in items]
+            return _parse_scalar(raw)
+    return default
+
+
+def _merge_frontmatter(existing_entries, owned_pairs):
+    """CLI-owned keys overwrite; any other key the user added is preserved."""
+    owned_map = {}
+    for k, v in owned_pairs:
+        owned_map[k] = _fm_lines(k, v)
+
+    result, seen = [], set()
+    for k, raw_lines in existing_entries:
+        if k in owned_map and k not in seen:
+            result.append((k, owned_map[k]))
+            seen.add(k)
+        elif k in seen:
+            continue  # drop duplicate of an owned key
+        else:
+            result.append((k, raw_lines))
+    for k, _v in owned_pairs:
+        if k not in seen:
+            result.append((k, owned_map[k]))
+            seen.add(k)
+    return result
+
+
+def _merge_body(existing_body: str, generated: str) -> str:
+    """Replace only what is between the generated markers; keep the rest verbatim."""
+    block = GEN_START + "\n" + generated.strip("\n") + "\n" + GEN_END
+    start = existing_body.find(GEN_START)
+    if start != -1:
+        end = existing_body.find(GEN_END, start)
+        if end != -1:
+            return existing_body[:start] + block + existing_body[end + len(GEN_END):]
+    if existing_body.strip():
+        return existing_body.rstrip("\n") + "\n\n" + block + "\n"
+    return block + "\n"
+
+
+def _render_note(entries, body: str) -> str:
+    out = ["---"]
+    for _k, raw_lines in entries:
+        out.extend(raw_lines)
+    out.append("---")
+    out.append("")
+    text = "\n".join(out) + body.lstrip("\n")
+    if not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def _write_note(path: Path, owned_pairs, generated_body: str, stats: dict, dry_run: bool):
+    """Create or update one note. Returns 'created' | 'updated' | 'unchanged'."""
+    old_text = None
+    if path.exists():
+        try:
+            old_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            old_text = None
+
+    entries, body = _split_note(old_text) if old_text is not None else ([], "")
+    new_text = _render_note(_merge_frontmatter(entries, owned_pairs), _merge_body(body, generated_body))
+
+    if old_text is not None and old_text == new_text:
+        stats["unchanged"] += 1
+        return "unchanged"
+
+    action = "updated" if old_text is not None else "created"
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_text, encoding="utf-8")
+    stats[action] += 1
+    return action
+
+
+def _md_escape(text) -> str:
+    """Make a value safe inside a markdown table cell."""
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+# ── Vault availability ─────────────────────────────────────────────
+
+def _vault_root():
+    """Return (root_path, reason). root_path is None when the vault is unusable."""
+    config = _load_json(CONFIG_FILE, {}) or {}
+    raw = str(config.get("vault_path", "") or "").strip()
+    if not raw:
+        return None, "vault_path is not configured (run: config set --vault-path <path>)"
+    try:
+        base = Path(raw).expanduser()
+        if not base.exists():
+            return None, f"vault path does not exist (NAS not mounted?): {base}"
+        if not base.is_dir():
+            return None, f"vault path is not a directory: {base}"
+        if not os.access(base, os.W_OK):
+            return None, f"vault path is not writable: {base}"
+    except OSError as e:
+        return None, f"vault path is not accessible: {e}"
+    return base / VAULT_ROOT_NAME, ""
+
+
+def _parse_only(value, allowed):
+    if not value:
+        return list(allowed)
+    picked = [t.strip() for t in str(value).split(",") if t.strip()]
+    return [t for t in picked if t in allowed]
+
+
+# ── Source data → note payloads ────────────────────────────────────
+
+def _essay_body(record: dict) -> str:
+    """Read the archived essay text, stripping the header writing add wrote."""
+    filename = record.get("file", "")
+    if not filename:
+        return ""
+    path = WRITING_DIR / filename
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    lines = text.split("\n")
+    i = 0
+    if i < len(lines) and lines[i].startswith("# "):
+        i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    saw_header = False
+    if i < len(lines) and lines[i].startswith("**Date:**"):
+        i += 1
+        saw_header = True
+    if i < len(lines) and lines[i].startswith("**Task Type:**"):
+        i += 1
+        saw_header = True
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return "\n".join(lines[i:]).strip() if saw_header else text.strip()
+
+
+def _writing_items():
+    """[(note_id, record)] with stable, unique ids."""
+    index = _load_json(WRITING_DIR / "index.json", []) or []
+    items, used = [], set()
+    for rec in index:
+        filename = rec.get("file", "")
+        base = filename[:-3] if filename.endswith(".md") else ""
+        if not base:
+            base = f"{rec.get('date', _today())}-{_slug(rec.get('topic', '') or 'essay')}"
+        nid, n = base, 2
+        while nid in used:
+            nid = f"{base}-{n}"
+            n += 1
+        used.add(nid)
+        items.append((nid, rec))
+    return items
+
+
+def _speaking_items():
+    index = _load_json(SPEAKING_DIR / "index.json", []) or []
+    items, used = [], set()
+    for rec in index:
+        base = f"{rec.get('date', _today())}-{_slug(rec.get('topic', '') or 'speaking')}"
+        nid, n = base, 2
+        while nid in used:
+            nid = f"{base}-{n}"
+            n += 1
+        used.add(nid)
+        items.append((nid, rec))
+    return items
+
+
+def _synonym_groups():
+    """{word: [ {synonym, source, context, date}, ... ]} from synonyms.json."""
+    groups = {}
+    for entry in _load_json(SYNONYMS_FILE, []) or []:
+        word = str(entry.get("word", "")).strip()
+        if not word:
+            continue
+        groups.setdefault(word, []).append(entry)
+    return groups
+
+
+def _vocab_synonyms(word: str, vocab_entry: dict, groups: dict) -> list:
+    """Union of the word's own synonyms list and the synonym library."""
+    out, seen = [], set()
+    for s in (vocab_entry.get("synonyms") or []):
+        s = str(s).strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    for key, entries in groups.items():
+        if key.lower() != word.lower():
+            continue
+        for e in entries:
+            s = str(e.get("synonym", "")).strip()
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                out.append(s)
+    return out
+
+
+# ── Note body generators ───────────────────────────────────────────
+
+def _body_memory(mem: dict) -> str:
+    lines = [str(mem.get("content", "")).strip(), ""]
+    tags = f"#ielts/memory/{mem.get('category', 'note')} #ielts/skill/{mem.get('skill', 'general')}"
+    lines.append(tags)
+    return "\n".join(lines)
+
+
+def _body_writing(rec: dict) -> str:
+    scores = rec.get("scores", {}) or {}
+    lines = [f"# {rec.get('topic') or 'Essay'}", ""]
+    lines.append(f"- **Task:** {rec.get('task_type', '')}　**Words:** {rec.get('word_count', 0)}　**Total:** {rec.get('total', 0)}")
+    if scores:
+        lines.append("- **Scores:** " + "　".join(f"{k} {v}" for k, v in scores.items()))
+    issues = rec.get("key_issues") or []
+    if issues:
+        lines.append("")
+        lines.append("## Key issues")
+        lines.extend(f"- {i}" for i in issues)
+    body = _essay_body(rec)
+    lines.append("")
+    lines.append("## Essay")
+    lines.append("")
+    lines.append(body if body else "_(essay file not found in ~/.ielts/writing/)_")
+    return "\n".join(lines)
+
+
+def _body_vocab(v: dict, synonyms: list) -> str:
+    lines = [f"# {v.get('word', '')}", ""]
+    if v.get("definition"):
+        lines.append(str(v["definition"]))
+        lines.append("")
+    if v.get("example"):
+        lines.append(f"> {v['example']}")
+        lines.append("")
+    lines.append("## Synonyms")
+    if synonyms:
+        lines.extend(f"- [[{s}]]" for s in synonyms)
+    else:
+        lines.append("_(none yet)_")
+    lines.append("")
+    lines.append("## Review")
+    lines.append(
+        f"- next: {v.get('next_review', '') or '-'}　interval: {v.get('interval', 0)}d"
+        f"　reps: {v.get('repetitions', 0)}　EF: {v.get('ease_factor', 2.5)}"
+    )
+    return "\n".join(lines)
+
+
+def _body_synonym(word: str, entries: list) -> str:
+    lines = [f"# {word}", "", "## Synonyms", ""]
+    seen = set()
+    for e in entries:
+        s = str(e.get("synonym", "")).strip()
+        if not s or s.lower() in seen:
+            continue
+        seen.add(s.lower())
+        extra = []
+        if e.get("source"):
+            extra.append(str(e["source"]))
+        if e.get("context"):
+            extra.append(str(e["context"]))
+        suffix = f" — {' · '.join(extra)}" if extra else ""
+        lines.append(f"- [[{s}]]{suffix}")
+    if not seen:
+        lines.append("_(none)_")
+    lines.append("")
+    lines.append(f"Back to [[{word}]] in vocab.")
+    return "\n".join(lines)
+
+
+def _body_speaking(rec: dict) -> str:
+    lines = [f"# {rec.get('topic') or 'Speaking'}", ""]
+    lines.append(f"- **Part:** {rec.get('part', '')}　**Group:** {rec.get('group', '') or '-'}")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("")
+    lines.append(str(rec.get("notes", "")).strip() or "_(no notes)_")
+    return "\n".join(lines)
+
+
+def _body_progress() -> str:
+    config = _load_json(CONFIG_FILE, asdict(Config())) or {}
+    progress = _load_json(PROGRESS_FILE, {}) or {}
+    cfg = Config(**{k: v for k, v in config.items() if k in Config.__dataclass_fields__})
+
+    lines = ["# 進度", "", "## 目標", "", "| 項目 | 值 |", "| --- | --- |"]
+    lines.append(f"| 目標分 | {config.get('target_score', 0)} |")
+    lines.append(f"| 考試日期 | {config.get('exam_date', '') or '-'} |")
+    lines.append(f"| 剩餘天數 | {cfg.days_until_exam()} |")
+    lines.append(f"| 自評總分 | {cfg.overall_band()} |")
+    for skill in ["listening", "reading", "writing", "speaking"]:
+        lines.append(f"| 自評 {skill} | {config.get(skill, 0)} |")
+
+    lines += ["", "## 分數趨勢", "", "| 科目 | 次數 | 最早 | 最新 | 變化 |", "| --- | --- | --- | --- | --- |"]
+    for skill in ["writing", "reading", "listening", "speaking"]:
+        scores = progress.get(f"{skill}_scores", []) or []
+        if not scores:
+            lines.append(f"| {skill} | 0 | - | - | - |")
+            continue
+        first, last = scores[0]["score"], scores[-1]["score"]
+        delta = round(last - first, 1)
+        lines.append(f"| {skill} | {len(scores)} | {first} | {last} | {delta:+} |")
+
+    for skill in ["writing", "reading", "listening", "speaking"]:
+        scores = progress.get(f"{skill}_scores", []) or []
+        if not scores:
+            continue
+        lines += ["", f"### {skill} 逐次記錄", "", "| 日期 | 分數 |", "| --- | --- |"]
+        lines += [f"| {s.get('date', '')} | {s.get('score', '')} |" for s in scores]
+
+    reading = _load_json(READING_DIR / "index.json", []) or []
+    lines += ["", "## 閱讀記錄", ""]
+    if reading:
+        lines += ["| 日期 | 文章 | 對/總 | Band | 同義替換 |", "| --- | --- | --- | --- | --- |"]
+        for r in reading:
+            lines.append(
+                f"| {r.get('date', '')} | {_md_escape(r.get('passage_title', ''))} | "
+                f"{r.get('correct', 0)}/{r.get('total_questions', 0)} | {r.get('score', 0)} | "
+                f"{r.get('synonyms_added', 0)} |"
+            )
+    else:
+        lines.append("_(尚無記錄)_")
+
+    listening = _load_json(LISTENING_DIR / "index.json", []) or []
+    lines += ["", "## 聽力記錄", ""]
+    if listening:
+        lines += ["| 日期 | 測驗 | 對/總 | Band |", "| --- | --- | --- | --- |"]
+        for r in listening:
+            lines.append(
+                f"| {r.get('date', '')} | {_md_escape(r.get('test_name', ''))} | "
+                f"{r.get('correct', 0)}/{r.get('total_questions', 0)} | {r.get('score', 0)} |"
+            )
+    else:
+        lines.append("_(尚無記錄)_")
+
+    return "\n".join(lines)
+
+
+def _body_errors() -> str:
+    errors = _load_json(ERRORS_FILE, {}) or {}
+    lines = ["# 錯題本", ""]
+    total = 0
+    for cat in ["writing", "reading", "listening", "speaking"]:
+        items = sorted(errors.get(cat, []) or [], key=lambda x: x.get("count", 0), reverse=True)
+        total += len(items)
+        lines += ["", f"## {cat}", ""]
+        if not items:
+            lines.append("_(尚無記錄)_")
+            continue
+        lines += ["| 次數 | 標籤 | 首次 | 最近 |", "| --- | --- | --- | --- |"]
+        for it in items:
+            lines.append(
+                f"| {it.get('count', 0)} | {_md_escape(it.get('tag', ''))} | "
+                f"{it.get('first_seen', '')} | {it.get('last_seen', '')} |"
+            )
+    if total == 0:
+        lines.insert(1, "_(尚無錯題記錄)_")
+    return "\n".join(lines)
+
+
+def _body_moc(counts: dict) -> str:
+    memories = _load_json(MEMORY_FILE, []) or []
+    vocab = _load_json(VOCAB_FILE, []) or []
+    groups = _synonym_groups()
+    due = len([v for v in vocab if str(v.get("next_review", "")) <= _today()])
+
+    lines = ["# IELTS", "", "## 摘要", "", "| 項目 | 數量 |", "| --- | --- |"]
+    lines.append(f"| 作文 | {counts.get('writing', 0)} |")
+    lines.append(f"| 口說 | {counts.get('speaking', 0)} |")
+    lines.append(f"| 單字 | {len(vocab)} |")
+    lines.append(f"| 今日待複習 | {due} |")
+    lines.append(f"| 同義替換詞頭 | {len(groups)} |")
+    lines.append(f"| 教練記憶 | {len(memories)} |")
+
+    lines += ["", "## 總覽", "", f"- [[{VAULT_ROOT_NAME}/進度|進度]]", f"- [[{VAULT_ROOT_NAME}/錯題本|錯題本]]"]
+
+    def section(title, links):
+        lines.append("")
+        lines.append(f"## {title}")
+        lines.append("")
+        if links:
+            lines.extend(links)
+        else:
+            lines.append("_(尚無)_")
+
+    section("作文", [
+        f"- [[{VAULT_ROOT_NAME}/writing/{nid}|{rec.get('date', '')} {rec.get('topic') or 'Essay'}]] — {rec.get('total', 0)}"
+        for nid, rec in _writing_items()
+    ])
+    section("口說", [
+        f"- [[{VAULT_ROOT_NAME}/speaking/{nid}|{rec.get('date', '')} {rec.get('topic') or 'Speaking'}]]"
+        for nid, rec in _speaking_items()
+    ])
+    section("教練記憶", [
+        f"- [[{VAULT_ROOT_NAME}/memory/{m.get('date', '')}-{m.get('id', '')}|{m.get('date', '')} {m.get('category', '')}]]"
+        f" — {_md_escape(str(m.get('content', ''))[:60])}"
+        for m in sorted(memories, key=lambda x: str(x.get("date", "")), reverse=True)
+    ])
+    section("單字", ["- " + "、".join(f"[[{v.get('word', '')}]]" for v in vocab)] if vocab else [])
+    section("同義替換", ["- " + "、".join(f"[[{VAULT_ROOT_NAME}/synonym/{w}|{w}]]" for w in sorted(groups))] if groups else [])
+
+    return "\n".join(lines)
+
+
+# ── vault export ───────────────────────────────────────────────────
+
+def _export(root: Path, types, dry_run: bool) -> dict:
+    stats = {"created": 0, "updated": 0, "unchanged": 0}
+    per_type = {}
+
+    def track(name, fn):
+        before = dict(stats)
+        fn()
+        per_type[name] = {k: stats[k] - before[k] for k in stats}
+
+    if "memory" in types:
+        def do_memory():
+            for m in _load_json(MEMORY_FILE, []) or []:
+                mid = m.get("id", "")
+                mdate = m.get("date", "") or _today()
+                path = root / "memory" / f"{_safe_filename(f'{mdate}-{mid}')}.md"
+                owned = [
+                    ("date", mdate),
+                    ("category", m.get("category", "note")),
+                    ("skill", m.get("skill", "general")),
+                    ("priority", m.get("priority", "medium")),
+                    ("source", m.get("source", "")),
+                    ("tags", [f"ielts/memory/{m.get('category', 'note')}", f"ielts/skill/{m.get('skill', 'general')}"]),
+                    ("ielts_type", "memory"),
+                    ("ielts_id", mid),
+                    ("ielts_managed", True),
+                ]
+                _write_note(path, owned, _body_memory(m), stats, dry_run)
+        track("memory", do_memory)
+
+    if "writing" in types:
+        def do_writing():
+            for nid, rec in _writing_items():
+                path = root / "writing" / f"{_safe_filename(nid)}.md"
+                owned = [
+                    ("date", rec.get("date", "")),
+                    ("task_type", rec.get("task_type", "")),
+                    ("topic", rec.get("topic", "")),
+                    ("word_count", rec.get("word_count", 0)),
+                    ("scores", rec.get("scores", {}) or {}),
+                    ("total", rec.get("total", 0)),
+                    ("key_issues", rec.get("key_issues", []) or []),
+                    ("tags", ["ielts/writing"]),
+                    ("ielts_type", "writing"),
+                    ("ielts_id", nid),
+                    ("ielts_managed", True),
+                ]
+                _write_note(path, owned, _body_writing(rec), stats, dry_run)
+        track("writing", do_writing)
+
+    groups = _synonym_groups()
+
+    if "vocab" in types:
+        def do_vocab():
+            for v in _load_json(VOCAB_FILE, []) or []:
+                word = str(v.get("word", "")).strip()
+                if not word:
+                    continue
+                syns = _vocab_synonyms(word, v, groups)
+                path = root / "vocab" / f"{_safe_filename(word)}.md"
+                owned = [
+                    ("word", word),
+                    ("definition", v.get("definition", "")),
+                    ("example", v.get("example", "")),
+                    ("date_added", v.get("date_added", "")),
+                    ("source", v.get("source", "")),
+                    ("ease_factor", v.get("ease_factor", 2.5)),
+                    ("interval", v.get("interval", 0)),
+                    ("repetitions", v.get("repetitions", 0)),
+                    ("next_review", v.get("next_review", "")),
+                    ("last_reviewed", v.get("last_reviewed", "")),
+                    ("tags", ["ielts/vocab"]),
+                    ("ielts_type", "vocab"),
+                    ("ielts_id", word.lower()),
+                    ("ielts_managed", True),
+                ]
+                _write_note(path, owned, _body_vocab(v, syns), stats, dry_run)
+        track("vocab", do_vocab)
+
+    if "synonym" in types:
+        def do_synonym():
+            for word in sorted(groups):
+                entries = groups[word]
+                path = root / "synonym" / f"{_safe_filename(word)}.md"
+                owned = [
+                    ("word", word),
+                    ("synonym_count", len({str(e.get("synonym", "")).lower() for e in entries})),
+                    ("tags", ["ielts/synonym"]),
+                    ("ielts_type", "synonym"),
+                    ("ielts_id", word.lower()),
+                    ("ielts_managed", True),
+                ]
+                _write_note(path, owned, _body_synonym(word, entries), stats, dry_run)
+        track("synonym", do_synonym)
+
+    if "speaking" in types:
+        def do_speaking():
+            for nid, rec in _speaking_items():
+                path = root / "speaking" / f"{_safe_filename(nid)}.md"
+                owned = [
+                    ("date", rec.get("date", "")),
+                    ("topic", rec.get("topic", "")),
+                    ("part", rec.get("part", "")),
+                    ("group", rec.get("group", "")),
+                    ("tags", ["ielts/speaking"]),
+                    ("ielts_type", "speaking"),
+                    ("ielts_id", nid),
+                    ("ielts_managed", True),
+                ]
+                _write_note(path, owned, _body_speaking(rec), stats, dry_run)
+        track("speaking", do_speaking)
+
+    if "progress" in types:
+        def do_progress():
+            owned = [
+                ("ielts_type", "progress"),
+                ("ielts_id", "progress"),
+                ("ielts_managed", True),
+                ("tags", ["ielts/progress"]),
+            ]
+            _write_note(root / "進度.md", owned, _body_progress(), stats, dry_run)
+        track("progress", do_progress)
+
+    if "errors" in types:
+        def do_errors():
+            owned = [
+                ("ielts_type", "errors"),
+                ("ielts_id", "errors"),
+                ("ielts_managed", True),
+                ("tags", ["ielts/errors"]),
+            ]
+            _write_note(root / "錯題本.md", owned, _body_errors(), stats, dry_run)
+        track("errors", do_errors)
+
+    # The MOC always regenerates so its links/counts stay in sync.
+    def do_moc():
+        counts = {
+            "writing": len(_writing_items()),
+            "speaking": len(_speaking_items()),
+        }
+        owned = [
+            ("ielts_type", "moc"),
+            ("ielts_id", "moc"),
+            ("ielts_managed", True),
+            ("tags", ["ielts/moc"]),
+        ]
+        _write_note(root / f"{VAULT_ROOT_NAME}.md", owned, _body_moc(counts), stats, dry_run)
+    track("moc", do_moc)
+
+    return {"totals": stats, "by_type": per_type}
+
+
+def cmd_vault_export(args):
+    """Project ~/.ielts JSON into the Obsidian vault as Markdown notes."""
+    try:
+        root, reason = _vault_root()
+        if root is None:
+            print(json.dumps({"status": "skipped", "reason": reason}, ensure_ascii=False))
+            return 0
+
+        types = _parse_only(getattr(args, "only", ""), EXPORT_TYPES)
+        if not types:
+            print(json.dumps({"status": "skipped", "reason": "no valid --only types given"}, ensure_ascii=False))
+            return 0
+
+        dry_run = bool(getattr(args, "dry_run", False))
+        if not dry_run:
+            root.mkdir(parents=True, exist_ok=True)
+
+        result = _export(root, types, dry_run)
+        print(json.dumps({
+            "status": "ok",
+            "dry_run": dry_run,
+            "root": str(root),
+            "types": types,
+            **result,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as e:  # fail-soft: never break the calling skill
+        print(json.dumps({"status": "skipped", "reason": f"export failed: {e}"}, ensure_ascii=False))
+        return 0
+
+
+# ── vault import ───────────────────────────────────────────────────
+
+def _body_text_only(body: str) -> str:
+    """Body with any generated block removed."""
+    start = body.find(GEN_START)
+    if start != -1:
+        end = body.find(GEN_END, start)
+        if end != -1:
+            body = body[:start] + body[end + len(GEN_END):]
+    return body.strip()
+
+
+def _is_managed(entries) -> bool:
+    return bool(_fm_get(entries, "ielts_id")) or _fm_get(entries, "ielts_managed") is True
+
+
+def _scan_unmanaged(folder: Path):
+    """Yield (path, entries, body) for notes the CLI does not already own."""
+    if not folder.is_dir():
+        return
+    for path in sorted(folder.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        entries, body = _split_note(text)
+        if _is_managed(entries):
+            continue
+        yield path, entries, body
+
+
+def cmd_vault_import(args):
+    """Pull manually-created vault notes back into the JSON store."""
+    try:
+        root, reason = _vault_root()
+        if root is None:
+            print(json.dumps({"status": "skipped", "reason": reason}, ensure_ascii=False))
+            return 0
+
+        types = _parse_only(getattr(args, "only", ""), IMPORT_TYPES)
+        dry_run = bool(getattr(args, "dry_run", False))
+        result = {"vocab": {"imported": [], "skipped": []}, "memory": {"imported": [], "skipped": []}}
+        renames = []
+
+        if "vocab" in types:
+            vocab = _load_json(VOCAB_FILE, []) or []
+            known = {str(v.get("word", "")).lower() for v in vocab}
+            added = False
+            for path, entries, body in _scan_unmanaged(root / "vocab"):
+                word = str(_fm_get(entries, "word", "") or "").strip() or path.stem
+                if word.lower() in known:
+                    result["vocab"]["skipped"].append({"file": path.name, "reason": "word already in vocab.json"})
+                    continue
+                text = _body_text_only(body)
+                definition = str(_fm_get(entries, "definition", "") or "").strip()
+                if not definition:
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            definition = line
+                            break
+                raw_syn = _fm_get(entries, "synonyms", []) or []
+                syns = [str(s).strip() for s in raw_syn if str(s).strip()] if isinstance(raw_syn, list) else []
+                entry = VocabWord(
+                    word=word,
+                    definition=definition,
+                    example=str(_fm_get(entries, "example", "") or ""),
+                    synonyms=syns,
+                    source=str(_fm_get(entries, "source", "") or "obsidian"),
+                    date_added=str(_fm_get(entries, "date_added", "") or _today()),
+                    next_review=_today(),
+                )
+                known.add(word.lower())
+                result["vocab"]["imported"].append({"file": path.name, "word": word})
+                if not dry_run:
+                    vocab.append(asdict(entry))
+                    added = True
+                    for s in syns:
+                        cmd_synonym_add_internal(word, s, "obsidian")
+                canonical = root / "vocab" / f"{_safe_filename(word)}.md"
+                if canonical != path and not canonical.exists():
+                    renames.append((path, canonical))
+            if added and not dry_run:
+                _save_json(VOCAB_FILE, vocab)
+
+        if "memory" in types:
+            memories = _load_json(MEMORY_FILE, []) or []
+            known_content = {str(m.get("content", "")).strip() for m in memories}
+            added = False
+            for path, entries, body in _scan_unmanaged(root / "memory"):
+                content = str(_fm_get(entries, "content", "") or "").strip()
+                if not content:
+                    text = _body_text_only(body)
+                    lines = [ln for ln in text.split("\n") if not ln.strip().startswith("#ielts/")]
+                    if lines and lines[0].startswith("# "):
+                        lines = lines[1:]
+                    content = "\n".join(lines).strip()
+                if not content:
+                    result["memory"]["skipped"].append({"file": path.name, "reason": "empty content"})
+                    continue
+                if content in known_content:
+                    result["memory"]["skipped"].append({"file": path.name, "reason": "identical memory already exists"})
+                    continue
+
+                def pick(key, allowed, fallback):
+                    val = str(_fm_get(entries, key, "") or "").strip().lower()
+                    return val if val in allowed else fallback
+
+                mdate = str(_fm_get(entries, "date", "") or "").strip() or _today()
+                mid = hashlib.md5(f"{path.name}{content}".encode("utf-8")).hexdigest()[:8]
+                mem = CoachMemory(
+                    id=mid,
+                    date=mdate,
+                    category=pick("category", MEMORY_CATEGORIES, "note"),
+                    skill=pick("skill", MEMORY_SKILLS, "general"),
+                    content=content,
+                    source=str(_fm_get(entries, "source", "") or "obsidian"),
+                    priority=pick("priority", MEMORY_PRIORITIES, "medium"),
+                )
+                known_content.add(content)
+                result["memory"]["imported"].append({"file": path.name, "id": mid})
+                if not dry_run:
+                    memories.append(asdict(mem))
+                    added = True
+                canonical = root / "memory" / f"{_safe_filename(f'{mdate}-{mid}')}.md"
+                if canonical != path and not canonical.exists():
+                    renames.append((path, canonical))
+            if added and not dry_run:
+                _save_json(MEMORY_FILE, memories)
+
+        renamed = []
+        if not dry_run:
+            for src, dst in renames:
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(str(src), str(dst))
+                    renamed.append({"from": src.name, "to": dst.name})
+                except OSError as e:
+                    result.setdefault("errors", []).append(f"rename {src.name}: {e}")
+
+        # Re-export so the freshly imported notes get their ids and managed flag.
+        export_result = None
+        imported_any = bool(result["vocab"]["imported"] or result["memory"]["imported"])
+        if imported_any and not dry_run:
+            export_types = [t for t in types if t in EXPORT_TYPES]
+            if "vocab" in export_types:
+                export_types.append("synonym")
+            export_result = _export(root, export_types, False)
+
+        print(json.dumps({
+            "status": "ok",
+            "dry_run": dry_run,
+            "root": str(root),
+            "types": types,
+            "imported": {
+                "vocab": len(result["vocab"]["imported"]),
+                "memory": len(result["memory"]["imported"]),
+            },
+            "skipped": {
+                "vocab": len(result["vocab"]["skipped"]),
+                "memory": len(result["memory"]["skipped"]),
+            },
+            "detail": result,
+            "renamed": renamed,
+            "re_export": export_result,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as e:  # fail-soft
+        print(json.dumps({"status": "skipped", "reason": f"import failed: {e}"}, ensure_ascii=False))
+        return 0
+
+
+def cmd_vault_status(args):
+    """Report vault reachability and per-type counts."""
+    try:
+        config = _load_json(CONFIG_FILE, {}) or {}
+        vault_path = str(config.get("vault_path", "") or "")
+        root, reason = _vault_root()
+        if root is None:
+            print(json.dumps({
+                "status": "skipped",
+                "available": False,
+                "vault_path": vault_path,
+                "reason": reason,
+            }, ensure_ascii=False, indent=2))
+            return 0
+
+        def note_count(sub):
+            d = root / sub
+            return len(list(d.glob("*.md"))) if d.is_dir() else 0
+
+        vocab = _load_json(VOCAB_FILE, []) or []
+        groups = _synonym_groups()
+        types = {
+            "memory": {"source": len(_load_json(MEMORY_FILE, []) or []), "notes": note_count("memory")},
+            "writing": {"source": len(_writing_items()), "notes": note_count("writing")},
+            "vocab": {"source": len(vocab), "notes": note_count("vocab")},
+            "synonym": {"source": len(groups), "notes": note_count("synonym")},
+            "speaking": {"source": len(_speaking_items()), "notes": note_count("speaking")},
+            "progress": {"source": 1, "notes": 1 if (root / "進度.md").exists() else 0},
+            "errors": {"source": 1, "notes": 1 if (root / "錯題本.md").exists() else 0},
+        }
+
+        unmanaged = {
+            "vocab": len(list(_scan_unmanaged(root / "vocab"))),
+            "memory": len(list(_scan_unmanaged(root / "memory"))),
+        }
+
+        print(json.dumps({
+            "status": "ok",
+            "available": True,
+            "vault_path": vault_path,
+            "root": str(root),
+            "root_exists": root.exists(),
+            "types": types,
+            "unmanaged_notes": unmanaged,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as e:  # fail-soft
+        print(json.dumps({"status": "skipped", "reason": f"status failed: {e}"}, ensure_ascii=False))
+        return 0
+
+
 # ── CLI Main ───────────────────────────────────────────────────────
 
 def main():
+    _resolve_paths()  # honour IELTS_HOME at every invocation
     parser = argparse.ArgumentParser(description="IELTS Claude Skills Data Layer")
     sub = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -858,6 +1851,7 @@ def main():
     p_set.add_argument("--writing", type=float)
     p_set.add_argument("--speaking", type=float)
     p_set.add_argument("--name")
+    p_set.add_argument("--vault-path", help="Obsidian vault root (empty string disables vault sync)")
 
     # writing
     p_writing = sub.add_parser("writing", help="Writing data management")
@@ -982,6 +1976,17 @@ def main():
     # status
     sub.add_parser("status", help="Output status bar summary")
 
+    # vault (Obsidian sync)
+    p_vault = sub.add_parser("vault", help="Obsidian vault sync")
+    p_vault_sub = p_vault.add_subparsers(dest="vault_action")
+    p_vault_sub.add_parser("status", help="Show vault path, availability and counts")
+    p_ve = p_vault_sub.add_parser("export", help="Export JSON data to the vault as Markdown")
+    p_ve.add_argument("--only", default="", help="Comma list: " + ",".join(EXPORT_TYPES))
+    p_ve.add_argument("--dry-run", action="store_true")
+    p_vi = p_vault_sub.add_parser("import", help="Pull manually-added vault notes back into JSON")
+    p_vi.add_argument("--only", default="", help="Comma list: " + ",".join(IMPORT_TYPES))
+    p_vi.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -1005,6 +2010,7 @@ def main():
         "restore": lambda: cmd_restore(args),
         "status": lambda: cmd_status(args),
         "memory": lambda: _handle_memory(args),
+        "vault": lambda: _handle_vault(args),
     }
 
     handler = handlers.get(args.command)
@@ -1116,6 +2122,18 @@ def _handle_memory(args):
         return cmd_memory_delete(args)
     else:
         print("Usage: ielts_cli.py memory [add|list|search|delete]")
+        return 1
+
+
+def _handle_vault(args):
+    if args.vault_action == "status":
+        return cmd_vault_status(args)
+    elif args.vault_action == "export":
+        return cmd_vault_export(args)
+    elif args.vault_action == "import":
+        return cmd_vault_import(args)
+    else:
+        print("Usage: ielts_cli.py vault [status|export|import]")
         return 1
 
 

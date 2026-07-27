@@ -38,6 +38,8 @@
 
 - 数据驱动诊断 + 个人化训练计划
 
+- **Obsidian Vault 同步：** 一条命令把数据投影成 Obsidian 笔记（vault 可放 NAS），手写内容不会被覆盖
+
 - 一键备份 / 恢复
 
 ---
@@ -202,7 +204,8 @@ ielts-claude-skills/
 ├── ielts-dashboard/SKILL.md    # Dashboard 生成
 
 ├── shared/
-│   └── ielts_cli.py            # 数据层 CLI（Python stdlib）
+│   ├── ielts_cli.py            # 数据层 CLI（Python stdlib）
+│   └── test_ielts_cli.py       # 测试（stdlib unittest）
 
 ├── dashboard/
 │   └── template.html           # Dashboard HTML 模板
@@ -243,6 +246,64 @@ ielts-claude-skills/
 ```
 
 **纯本地，无云端。** 用 `python3 ~/.claude/skills/shared/ielts_cli.py backup` 备份。
+
+---
+
+## Obsidian Vault 同步
+
+把数据投影成 Obsidian 笔记，vault 可以放在 NAS 上。**JSON 仍是唯一 source of truth**，vault 里的 Markdown 是投影——SM-2 复习状态、错题计数只由 CLI 写。
+
+```bash
+CLI=~/.claude/skills/shared/ielts_cli.py
+
+# 1. 设定 vault 路径（一次性）
+python3 $CLI config set --vault-path /path/to/Obsidian
+
+# 2. 查看状态
+python3 $CLI vault status
+
+# 3. 导出（建议在一次练习 session 结束时跑一次，不用每笔记录都跑）
+python3 $CLI vault export
+python3 $CLI vault export --only vocab,synonym    # 只同步部分类型
+python3 $CLI vault export --dry-run               # 只看会做什么，不写档
+
+# 4. 把在 Obsidian 手动新增的笔记收回 JSON
+python3 $CLI vault import
+```
+
+生成的结构（根目录 `<vault>/IELTS/`）：
+
+```text
+IELTS/
+├── IELTS.md      # MOC 索引 + 摘要数字
+├── 进度.md        # 目标 / 分数趋势 / 阅读记录表 / 听力记录表
+├── 错题本.md      # 按次数排序的错误标签
+├── memory/       # 教练记忆
+├── writing/      # 作文全文 + 四维评分
+├── vocab/        # 单词（含 SM-2 状态，同义词为 [[双链]]）
+├── synonym/      # 同义替换词头
+└── speaking/     # 口语练习
+```
+
+**几个关键性质：**
+
+- **手写内容不会丢。** 笔记 body 里生成的部分被 `<!-- ielts:generated:start -->` / `<!-- ielts:generated:end -->` 包住，重新导出只覆写标记之间；标记外的手写内容逐字保留。frontmatter 里用户自己加的 key 也保留。
+
+- **内容没变就不重写文件**，避免 NAS / 同步工具产生无谓的 mtime 变动。
+
+- **NAS 没挂载不会挂。** `vault_path` 未设定、路径不存在或不可写时，命令输出 `{"status":"skipped","reason":"..."}` 并 exit 0。
+
+- **单向为主。** `vault import` 只收「没有 `ielts_id` / `ielts_managed`」的手动新增笔记（vocab / memory），已 managed 的笔记一律不从 vault 读回，避免双向冲突。
+
+---
+
+## 测试
+
+```bash
+python3 shared/test_ielts_cli.py
+```
+
+Stdlib `unittest`，用 `IELTS_HOME` 环境变量把数据目录指向临时目录，不会碰到真实的 `~/.ielts` 或你的 vault。
 
 ---
 
