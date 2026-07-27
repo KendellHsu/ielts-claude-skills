@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 使用者本機資料（實際存於 ~/.ielts/，此處僅防呆）
+.ielts/
