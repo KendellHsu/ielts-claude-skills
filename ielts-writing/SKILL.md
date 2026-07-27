@@ -151,17 +151,20 @@ python3 ~/.claude/skills/shared/ielts_cli.py error add --category writing --tag 
 
 ### Phase 2：四维评分
 
-按雅思官方四个维度打分，每维 0-9 分（0.5 间隔），给出总分。
+**打分前必须先读 `references/band-descriptors.md`**，逐维度对照 Band 4–9 的描述符定档，不要凭印象给分。那份文件同时规定了定档方法、跨档处理、取整规则和降分触发条件。
+
+关键提醒：
+
+- **Task 1 用 Task Achievement 表，Task 2 用 Task Response 表**，两张表判准不同，不可混用
+- 每个维度找「大部分描述符相符」的那一档，不是挑最亮眼的一条
+- 跨两档时取较低档
+- 打完分后核对降分触发表（漏答、无 overview、字数不足、模板文等有硬性封顶）
 
 #### 维度 1：Task Response / Task Achievement（TR/TA）— 25%
 
 **评什么：** 你回答了题目吗？回答完整吗？论点充分吗？
 
-| Band | 标准 |
-|------|------|
-| 7 | 回答了所有部分，立场清晰，论点充分展开，但偶尔过度概括 |
-| 6 | 回答了题目但部分论点不够充分，结论可能不清晰 |
-| 5 | 只部分回答了题目，论点有限，可能跑题 |
+Band 判准见 `references/band-descriptors.md` 的「Task Response」与「Task Achievement」两节。
 
 **重点检查：**
 
@@ -175,11 +178,7 @@ python3 ~/.claude/skills/shared/ielts_cli.py error add --category writing --tag 
 
 #### 维度 2：Coherence & Cohesion（CC）— 25%
 
-| Band | 标准 |
-|------|------|
-| 7 | 逻辑清晰，衔接自然，段落组织合理，偶尔过度使用连接词 |
-| 6 | 有逻辑但衔接有时机械，段落内可能缺少连贯性 |
-| 5 | 逻辑不够清晰，段落组织混乱，连接词使用不当 |
+Band 判准见 `references/band-descriptors.md` 的「Coherence & Cohesion」一节。
 
 **重点检查：**
 
@@ -193,11 +192,7 @@ python3 ~/.claude/skills/shared/ielts_cli.py error add --category writing --tag 
 
 #### 维度 3：Lexical Resource（LR）— 25%
 
-| Band | 标准 |
-|------|------|
-| 7 | 词汇量足够，能灵活使用不常见词汇，偶尔有搭配错误 |
-| 6 | 词汇基本够用，尝试使用不常见词汇但有时不准确 |
-| 5 | 词汇有限，经常重复，搭配错误较多 |
+Band 判准见 `references/band-descriptors.md` 的「Lexical Resource」一节。
 
 **重点检查：**
 
@@ -211,11 +206,7 @@ python3 ~/.claude/skills/shared/ielts_cli.py error add --category writing --tag 
 
 #### 维度 4：Grammatical Range & Accuracy（GRA）— 25%
 
-| Band | 标准 |
-|------|------|
-| 7 | 使用多种复杂句型，错误少且不影响理解 |
-| 6 | 混合使用简单句和复杂句，有语法错误但不频繁 |
-| 5 | 句型有限，错误频繁，部分影响理解 |
+Band 判准见 `references/band-descriptors.md` 的「Grammatical Range & Accuracy」一节。
 
 **重点检查：**
 
@@ -335,6 +326,8 @@ python3 ~/.claude/skills/shared/ielts_cli.py error add --category writing --tag 
 ---
 
 ## 评分校准提醒
+
+- 判准以 `references/band-descriptors.md` 为准，定档拿不准时往低报
 
 - AI 评分普遍偏高 0.5 分。提醒用户：实际考试分数可能比 AI 评分低 0.5
 
