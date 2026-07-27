@@ -8,11 +8,13 @@
 
 ### 日常开发
 
-- 工作目录：`/Users/xc/Documents/Obsidian Vaults/Notebook/Projects/ielts-claude-learn/ielts-claude-skills/`
+- 工作目录：`/Users/candle/ielts-claude-skills/`
 
 - 修改后推送到远端：`git push origin master`
 
-- 远端仓库：`git@github.com:xuchi-0808/ielts-claude-skills.git`
+- 远端仓库：`https://github.com/KendellHsu/ielts-claude-skills`（origin，分支 master）
+
+- 上游来源：本项目基于 `xuchi-0808/ielts-claude-skills`，见 LICENSE
 
 ### 遇到使用问题时
 
